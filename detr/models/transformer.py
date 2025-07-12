@@ -17,8 +17,10 @@ from torch import nn, Tensor
 import IPython
 e = IPython.embed
 
-class Transformer(nn.Module):
+import torch
+import torch.nn as nn
 
+class Transformer(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
@@ -26,7 +28,7 @@ class Transformer(nn.Module):
         super().__init__()
 
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+                                        dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
@@ -34,10 +36,10 @@ class Transformer(nn.Module):
                                                 dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
-                                          return_intermediate=return_intermediate_dec)
+                                        return_intermediate=return_intermediate_dec)
 
+        self.src_proj = nn.Linear(d_model, d_model)
         self._reset_parameters()
-
         self.d_model = d_model
         self.nhead = nhead
 
@@ -47,35 +49,80 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):
-        # TODO flatten only when input has H and W
-        if len(src.shape) == 4: # has H and W
-            # flatten NxCxHxW to HWxNxC
+        bs = src.shape[0]
+
+        if len(src.shape) == 4:
             bs, c, h, w = src.shape
             src = src.flatten(2).permute(2, 0, 1)
-            pos_embed = pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
-            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-            # mask = mask.flatten(1)
-
-            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim
-            pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
-
-            addition_input = torch.stack([latent_input, proprio_input], axis=0)
-            src = torch.cat([addition_input, src], axis=0)
+            if c != self.d_model:
+                src = self.src_proj(src)
+            pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
         else:
-            assert len(src.shape) == 3
-            # flatten NxHWxC to HWxNxC
-            bs, hw, c = src.shape
+            bs, seq_len, c = src.shape
+            if c != self.d_model:
+                src = self.src_proj(src)
             src = src.permute(1, 0, 2)
-            pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)
-            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+            pos_embed = pos_embed.unsqueeze(1).expand(-1, bs, -1)
 
+        query_embed = query_embed.unsqueeze(1).expand(-1, bs, -1)
         tgt = torch.zeros_like(query_embed)
+
+        # Ensure latent/proprio are (batch, 512)
+        latent_input = latent_input.squeeze(1) if latent_input.dim() == 3 else latent_input
+        proprio_input = proprio_input.squeeze(1) if proprio_input.dim() == 3 else proprio_input
+        # latent_input, proprio_input: [batch, dim] → ensure [batch, dim]
+        if latent_input.dim() == 1:
+            latent_input = latent_input.unsqueeze(0)  # [1, dim]
+        if proprio_input.dim() == 1:
+            proprio_input = proprio_input.unsqueeze(0)
+
+        if latent_input.shape[-1] != self.d_model:
+            latent_input = self.src_proj(latent_input)
+        if proprio_input.shape[-1] != self.d_model:
+            proprio_input = self.src_proj(proprio_input)
+
+        # # Fix batch dim mismatch
+        # if proprio_input.shape[0] != latent_input.shape[0]:
+        #     if proprio_input.shape[0] == 1:
+        #         proprio_input = proprio_input.expand(latent_input.shape[0], -1)
+        #     else:
+        #         proprio_input = proprio_input[:latent_input.shape[0]]
+        # ensure batch match
+        batch_size = src.shape[1]  # from image (after flatten and permute)
+        if latent_input.shape[0] != batch_size:
+            if latent_input.shape[0] == 1:
+                latent_input = latent_input.expand(batch_size, -1)
+            else:
+                latent_input = latent_input[:batch_size]
+        if proprio_input.shape[0] != batch_size:
+            if proprio_input.shape[0] == 1:
+                proprio_input = proprio_input.expand(batch_size, -1)
+            else:
+                proprio_input = proprio_input[:batch_size]
+        addition_input = torch.stack([latent_input, proprio_input], axis=0)
+
+        src = torch.cat([addition_input, src], axis=0)
+
+        if additional_pos_embed.dim() == 2:
+            additional_pos_embed = additional_pos_embed.unsqueeze(1)
+        if additional_pos_embed.shape[1] != pos_embed.shape[1]:
+            additional_pos_embed = additional_pos_embed.expand(-1, pos_embed.shape[1], -1)
+        pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
+
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)
+
+        # 🔥 Call your custom decoder (not PyTorch default)
+        hs = self.decoder(
+            tgt, memory,
+            tgt_mask=None,
+            memory_mask=None,
+            tgt_key_padding_mask=None,
+            memory_key_padding_mask=mask,
+            pos=pos_embed,
+            query_pos=query_embed
+        )
         hs = hs.transpose(1, 2)
         return hs
-
 class TransformerEncoder(nn.Module):
 
     def __init__(self, encoder_layer, num_layers, norm=None):

@@ -12,7 +12,9 @@ _wandb
 fuse.cfg
 
 *.ai
-
+# self_defined
+data/
+result/
 # Generation results
 results/
 

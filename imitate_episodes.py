@@ -8,7 +8,9 @@ from copy import deepcopy
 from itertools import repeat
 from tqdm import tqdm
 from einops import rearrange
-import wandb
+# import wandb
+# stevez
+import swanlab
 import time
 from torchvision import transforms
 
@@ -26,7 +28,8 @@ from sim_env import BOX_POSE
 
 import IPython
 e = IPython.embed
-
+# stevez shit prev_image
+prev_image_ulti = None
 def get_auto_index(dataset_dir):
     max_idx = 1000
     for i in range(max_idx+1):
@@ -144,9 +147,12 @@ def main(args):
         os.makedirs(ckpt_dir)
     config_path = os.path.join(ckpt_dir, 'config.pkl')
     expr_name = ckpt_dir.split('/')[-1]
+    # if not is_eval:
+    #     wandb.init(project="mobile-aloha2", reinit=True, entity="mobile-aloha2", name=expr_name)
+    #     wandb.config.update(config)
+    # swablab init stevez
     if not is_eval:
-        wandb.init(project="mobile-aloha2", reinit=True, entity="mobile-aloha2", name=expr_name)
-        wandb.config.update(config)
+        swanlab.init(project="act_flow", config=config)
     with open(config_path, 'wb') as f:
         pickle.dump(config, f)
     if is_eval:
@@ -163,7 +169,8 @@ def main(args):
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, name_filter, camera_names, batch_size_train, batch_size_val, args['chunk_size'], args['skip_mirrored_data'], config['load_pretrain'], policy_class, stats_dir_l=stats_dir, sample_weights=sample_weights, train_ratio=train_ratio)
-
+    print(f"train_dataloader: {train_dataloader}")
+    print(f"val_dataloader: {val_dataloader}")
     # save dataset stats
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
@@ -176,7 +183,9 @@ def main(args):
     ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Best ckpt, val loss {min_val_loss:.6f} @ step{best_step}')
-    wandb.finish()
+    # wandb.finish()
+    # swanlab finish stevez
+    swanlab.finish()
 
 
 def make_policy(policy_class, policy_config):
@@ -435,6 +444,7 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                 time4 = time.time()
                 raw_action = raw_action.squeeze(0).cpu().numpy()
                 action = post_process(raw_action)
+                print("action min:", action.min().item(), "max:", action.max().item(), "mean:", action.mean().item(), "std:", action.std().item())
                 target_qpos = action[:-2]
 
                 # if use_actuator_net:
@@ -501,10 +511,20 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
         episode_highest_reward = np.max(rewards)
         highest_rewards.append(episode_highest_reward)
         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
-
+        print(f"Step {t}:")
+        print(f"  raw_action: {raw_action}")
+        print(f"  action (post-processed): {action}")
+        print(f"  target_qpos: {target_qpos}")
+        print(f"  base_action: {base_action}")
+        print(f"  ts.reward: {ts.reward}")
         # if save_episode:
         #     save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
-
+    print(f"=== Rollout {rollout_id} Summary ===")
+    print(f"  episode_return: {episode_return}")
+    print(f"  episode_highest_reward: {episode_highest_reward}")
+    print(f"  env_max_reward: {env_max_reward}")
+    print(f"  Success (highest_reward == env_max_reward): {episode_highest_reward == env_max_reward}")
+    print("=======================================")
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
@@ -527,9 +547,14 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
 
 
 def forward_pass(data, policy):
+    global prev_image_ulti
     image_data, qpos_data, action_data, is_pad = data
+    prev_image = prev_image_ulti.cuda() if prev_image_ulti is not None else None # stevez
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    vq_sample = None
+    # vq_sample = vq_sample.cuda()
+    prev_image_ulti = image_data
+    return policy(qpos_data, image_data, action_data, is_pad, vq_sample, prev_image) # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -580,7 +605,8 @@ def train_bc(train_dataloader, val_dataloader, config):
                     best_ckpt_info = (step, min_val_loss, deepcopy(policy.serialize()))
             for k in list(validation_summary.keys()):
                 validation_summary[f'val_{k}'] = validation_summary.pop(k)            
-            wandb.log(validation_summary, step=step)
+            # wandb.log(validation_summary, step=step)
+            swanlab.log(validation_summary, step=step)
             print(f'Val loss:   {epoch_val_loss:.5f}')
             summary_string = ''
             for k, v in validation_summary.items():
@@ -594,7 +620,9 @@ def train_bc(train_dataloader, val_dataloader, config):
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
             torch.save(policy.serialize(), ckpt_path)
             success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
-            wandb.log({'success': success}, step=step)
+            # wandb.log({'success': success}, step=step)
+            swanlab.log({'success': success}, step=step)
+            # print(f'Success rate: {success:.3f}')
 
         # training
         policy.train()
@@ -605,8 +633,9 @@ def train_bc(train_dataloader, val_dataloader, config):
         loss = forward_dict['loss']
         loss.backward()
         optimizer.step()
-        wandb.log(forward_dict, step=step) # not great, make training 1-2% slower
-
+        # swanlab stevez
+        # wandb.log(forward_dict, step=step) # not great, make training 1-2% slower
+        swanlab.log(forward_dict, step=step) # swanlab stevez
         if step % save_every == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_step_{step}_seed_{seed}.ckpt')
             torch.save(policy.serialize(), ckpt_path)

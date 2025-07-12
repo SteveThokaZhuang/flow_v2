@@ -92,7 +92,7 @@ class DiffusionPolicy(nn.Module):
         return optimizer
 
 
-    def __call__(self, qpos, image, actions=None, is_pad=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None, prev_image=None):
         B = qpos.shape[0]
         if actions is not None: # training time
             nets = self.nets
@@ -206,17 +206,18 @@ class ACTPolicy(nn.Module):
         self.vq = args_override['vq']
         print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, vq_sample=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None, vq_sample=None, prev_image=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
         image = normalize(image)
+        prev_image = normalize(prev_image) if prev_image is not None else None
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
             loss_dict = dict()
-            a_hat, is_pad_hat, (mu, logvar), probs, binaries = self.model(qpos, image, env_state, actions, is_pad, vq_sample)
+            a_hat, is_pad_hat, (mu, logvar), probs, binaries = self.model(qpos, image, env_state, actions, is_pad, vq_sample, prev_image) #prev_image flow stevez
             if self.vq or self.model.encoder is None:
                 total_kld = [torch.tensor(0.0)]
             else:

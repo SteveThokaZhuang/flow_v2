@@ -10,10 +10,72 @@ from .backbone import build_backbone
 from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
 
 import numpy as np
-
+from torchvision.models.optical_flow import raft_small
+from detr.models.flow_backbone import FlowBackbone  # 绝对路径导入 stevez
 import IPython
 e = IPython.embed
+import torch.nn.functional as F
+# stevez
+# class AttentionFusion(nn.Module):
+#     def __init__(self, in_channels, hidden_dim):
+#         # 初始化函数，接收输入通道数和隐藏维度作为参数
+#         super().__init__()
+#         # 调用父类的初始化函数
+#         # self.attention = nn.Sequential(
+#         #     # 定义注意力机制，使用nn.Sequential将多个层组合在一起
+#         #     nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
+#         #     # 使用卷积层将输入通道数转换为隐藏维度，卷积核大小为1
+#         #     nn.ReLU(),
+#         #     # 使用ReLU激活函数
+#         #     nn.Conv2d(hidden_dim, in_channels, kernel_size=1),
+#         #     # 使用卷积层将隐藏维度转换回输入通道数，卷积核大小为1
+#         #     nn.Sigmoid()
+#         #     # 使用Sigmoid激活函数，将输出限制在0和1之间
+#         # )
+#         self.attention = nn.Sequential(
+#                 nn.Conv2d(in_channels, in_channels // 2, kernel_size=1),
+#                 nn.ReLU(),
+#                 nn.Conv2d(in_channels // 2, in_channels, kernel_size=1),
+#                 nn.Sigmoid()
+#             )
 
+#         self.out_conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
+class AttentionFusion(nn.Module):
+    def __init__(self, in_channels, hidden_dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, in_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.out_conv = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)  # 改：不要强压到 hidden_dim
+
+    def forward(self, x):
+        attn = self.attention(x)
+        out = x * attn
+        out = self.out_conv(out)
+        return out
+class OpticalFlowExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        # self.flownet = FlowNetSimple(pretrained=True)
+        # self.flownet = raft_small(pretrained=True).eval().half() # half precision
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.flownet = raft_small(pretrained=True).eval().float().to(device) # or half(float 16)
+
+    def forward(self, prev_imgs, current_imgs):
+        # prev_imgs: [batch, num_cam, 3, H, W]
+        # current_imgs: [batch, num_cam, 3, H, W]
+        # Returns optical flow [batch, num_cam, 2, H, W]
+        flows = []
+        
+        for cam_id in range(prev_imgs.shape[1]):
+            flow = self.flownet(prev_imgs[:, cam_id], current_imgs[:, cam_id])[-1]
+            flows.append(flow)
+        return torch.stack(flows, dim=1)
+        
 
 def reparametrize(mu, logvar):
     std = logvar.div(2).exp()
@@ -51,7 +113,20 @@ class DETRVAE(nn.Module):
         self.encoder = encoder
         self.vq, self.vq_class, self.vq_dim = vq, vq_class, vq_dim
         self.state_dim, self.action_dim = state_dim, action_dim
+        self.flow_extractor = OpticalFlowExtractor() # stevez
+        self.flow_extractor = self.flow_extractor.float() # stevez
         hidden_dim = transformer.d_model
+        # print(f"hidden_dim (transformer.d_model): {hidden_dim}")
+        # print(F"action_dim: {action_dim} (for action prediction)")
+        self.flow_backbones = nn.ModuleList([
+            FlowBackbone(in_channels=2, hidden_dim=hidden_dim)  # 输入通道为2（光流场的x,y分量）
+            for _ in camera_names
+        ])
+        # stevez
+        self.input_proj_flow = nn.Conv2d(self.flow_backbones[0].num_channels, hidden_dim, kernel_size=1)
+        # self.fusion_conv = AttentionFusion(1024, hidden_dim=1)
+        self.fusion_conv = AttentionFusion(1024, hidden_dim=128)
+
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
@@ -89,95 +164,199 @@ class DETRVAE(nn.Module):
 
     def encode(self, qpos, actions=None, is_pad=None, vq_sample=None):
         bs, _ = qpos.shape
-        if self.encoder is None:
-            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
-            latent_input = self.latent_out_proj(latent_sample)
-            probs = binaries = mu = logvar = None
+        probs = binaries = mu = logvar = None
+        
+        is_training = actions is not None  # Training or evaluation phase
+        
+        if is_training:
+            # Project the action sequence to the embedding dimension
+            action_embed = self.encoder_action_proj(actions)  # (bs, seq, hidden_dim)
+            # Use action_embed batch size as the true batch size in case of mismatch
+            actual_bs = action_embed.shape[0]
         else:
-            # cvae encoder
-            is_training = actions is not None # train or val
-            ### Obtain latent z from action sequence
-            if is_training:
-                # project action sequence to embedding dim, and concat with a CLS token
-                action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)
-                qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
-                qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)
-                cls_embed = self.cls_embed.weight # (1, hidden_dim)
-                cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1) # (bs, 1, hidden_dim)
-                encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)
-                encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)
-                # do not mask cls token
-                cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device) # False: not a padding
-                is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)
-                # obtain position embedding
-                pos_embed = self.pos_table.clone().detach()
-                pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
-                # query model
-                encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
-                encoder_output = encoder_output[0] # take cls output only
-                latent_info = self.latent_proj(encoder_output)
-                
-                if self.vq:
-                    logits = latent_info.reshape([*latent_info.shape[:-1], self.vq_class, self.vq_dim])
-                    probs = torch.softmax(logits, dim=-1)
-                    binaries = F.one_hot(torch.multinomial(probs.view(-1, self.vq_dim), 1).squeeze(-1), self.vq_dim).view(-1, self.vq_class, self.vq_dim).float()
-                    binaries_flat = binaries.view(-1, self.vq_class * self.vq_dim)
-                    probs_flat = probs.view(-1, self.vq_class * self.vq_dim)
-                    straigt_through = binaries_flat - probs_flat.detach() + probs_flat
-                    latent_input = self.latent_out_proj(straigt_through)
-                    mu = logvar = None
-                else:
-                    probs = binaries = None
-                    mu = latent_info[:, :self.latent_dim]
-                    logvar = latent_info[:, self.latent_dim:]
-                    latent_sample = reparametrize(mu, logvar)
-                    latent_input = self.latent_out_proj(latent_sample)
-
+            # In the evaluation phase, if there are no actions, create a placeholder action_embed
+            hidden_dim = self.encoder_action_proj.out_features
+            action_embed = torch.zeros(bs, 0, hidden_dim, device=qpos.device)  # (bs, 0, hidden_dim)
+            actual_bs = bs
+        
+        # Fix qpos_embed to ensure correct batch size - use actual_bs
+        qpos_embed = self.encoder_joint_proj(qpos)  # Shape [bs, 512]
+        if qpos_embed.shape[0] != actual_bs:
+            # If there's a batch size mismatch, expand or slice qpos_embed to match
+            if qpos_embed.shape[0] == 1 and actual_bs > 1:
+                qpos_embed = qpos_embed.expand(actual_bs, -1)  # Expand to match batch size
+            elif qpos_embed.shape[0] > actual_bs:
+                qpos_embed = qpos_embed[:actual_bs]  # Slice to match batch size
+        qpos_embed = qpos_embed.unsqueeze(1)  # Shape [actual_bs, 1, 512]
+        
+        # Fix cls_embed to ensure correct batch size - use actual_bs
+        cls_embed = self.cls_embed.weight  # Shape [1, 512]
+        cls_embed = cls_embed.unsqueeze(0)  # Shape [1, 1, 512]
+        cls_embed = cls_embed.expand(actual_bs, -1, -1)  # Shape [actual_bs, 1, 512]
+        
+        # Debug print to verify shapes
+        print(f'Shapes - cls: {cls_embed.shape}, qpos: {qpos_embed.shape}, action: {action_embed.shape}')
+        
+        # Concatenate tensors along sequence dimension
+        encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], dim=1)  # [actual_bs, 102, 512] or [actual_bs, 2, 512]
+        encoder_input = encoder_input.permute(1, 0, 2)  # (seq+2, actual_bs, hidden_dim)
+        
+        cls_joint_is_pad = torch.full((actual_bs, 2), False, device=qpos.device)  # False: not a padding
+        
+        if is_training:
+            if is_pad is not None:
+                is_pad = torch.cat([cls_joint_is_pad, is_pad], dim=1)  # (actual_bs, seq+2)
             else:
-                mu = logvar = binaries = probs = None
-                if self.vq:
-                    latent_input = self.latent_out_proj(vq_sample.view(-1, self.vq_class * self.vq_dim))
-                else:
-                    latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
-                    latent_input = self.latent_out_proj(latent_sample)
-
+                # If is_pad is None, create a tensor with appropriate dimensions
+                seq_length = action_embed.shape[1]
+                is_pad = torch.cat([cls_joint_is_pad, torch.full((actual_bs, seq_length), False, device=qpos.device)], dim=1)
+        else:
+            is_pad = cls_joint_is_pad
+        
+        # Obtain position embedding
+        if is_training:
+            pos_embed = self.pos_table.clone().detach()
+            pos_embed = pos_embed.permute(1, 0, 2)  # (seq+2, 1, hidden_dim)
+        else:
+            # In the evaluation phase, the position embedding only needs the cls and qpos parts
+            pos_embed = self.pos_table[:, :2].clone().detach()
+            pos_embed = pos_embed.permute(1, 0, 2)  # (2, 1, hidden_dim)
+        
+        # Query the model
+        encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+        encoder_output = encoder_output[0]  # Take only the cls output
+        latent_info = self.latent_proj(encoder_output)
+        
+        if self.vq:
+            logits = latent_info.reshape([*latent_info.shape[:-1], self.vq_class, self.vq_dim])
+            probs = torch.softmax(logits, dim=-1)
+            binaries = F.one_hot(torch.multinomial(probs.view(-1, self.vq_dim), 1).squeeze(-1), self.vq_dim).view(-1, self.vq_class, self.vq_dim).float()
+            binaries_flat = binaries.view(-1, self.vq_class * self.vq_dim)
+            probs_flat = probs.view(-1, self.vq_class * self.vq_dim)
+            straigt_through = binaries_flat - probs_flat.detach() + probs_flat
+            latent_input = self.latent_out_proj(straigt_through)
+            mu = logvar = None
+        else:
+            probs = binaries = None
+            mu = latent_info[:, :self.latent_dim]
+            logvar = latent_info[:, self.latent_dim:]
+            latent_sample = reparametrize(mu, logvar)
+            latent_input = self.latent_out_proj(latent_sample)
+        
         return latent_input, probs, binaries, mu, logvar
+   
+    # stevez
+    def forward(self, qpos, cur_image, env_state, actions=None, is_pad=None, vq_sample=None, prev_image=None):
+        # print(f"action in forward: {actions.shape}")
+        # print(f"action is :{actions}")
+        device = qpos.device  # 获取模型当前设备
+        if actions is not None:
+            actions = actions.float().to(device)
+        else:
+            actions = torch.zeros(8, 100, 16, device=device)
+        # print(f"actions shape : {actions.shape}")
+        # actions = actions.float()
+        # print(f"actions:{actions}")
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None):
-        """
-        qpos: batch, qpos_dim
-        image: batch, num_cam, channel, height, width
-        env_state: None
-        actions: batch, seq, action_dim
-        """
+        
         latent_input, probs, binaries, mu, logvar = self.encode(qpos, actions, is_pad, vq_sample)
 
-        # cvae decoder
-        if self.backbones is not None:
-            # Image observation features and position embeddings
-            all_cam_features = []
-            all_cam_pos = []
-            for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[cam_id](image[:, cam_id])
-                features = features[0] # take the last layer feature
-                pos = pos[0]
-                all_cam_features.append(self.input_proj(features))
-                all_cam_pos.append(pos)
-            # proprioception features
+        if self.backbones and self.flow_backbones is not None:
+      
+            with torch.no_grad():
+                if prev_image is not None:
+                    prev_image = prev_image.float()
+                    cur_image = cur_image.float()
+                    flow = self.flow_extractor(prev_image, cur_image)  # [bs, num_cam, 2, H, W]
+                    max_flow = 20.0  # 视你的场景而定，通常 10~40 像素
+                    flow = torch.clamp(flow, -max_flow, max_flow) / max_flow
+
+            
+         
+            all_features = []
+            all_positions = []
+            for cam_id in range(len(self.camera_names)):
+                # 光流分支
+                if prev_image is not None:
+                    flow_feat, flow_pos = self.flow_backbones[cam_id](flow[:, cam_id])
+                    flow_feat = self.input_proj_flow(flow_feat[0])  # [bs, hidden_dim, H, W]
+                    flow_pos = flow_pos[0]  # [bs, hidden_dim, H, W]
+                    flow_feat = F.interpolate(flow_feat, size=(15, 20), mode='bilinear', align_corners=False)
+
+                    # print(f"flow_feat shape: {flow_feat.shape}")  # 例如 [bs, hidden_dim, 60, 60]
+
+                # 图像分支
+                img_feat, img_pos = self.backbones[cam_id](cur_image[:, cam_id])
+                img_feat = self.input_proj(img_feat[0])  # [bs, hidden_dim, H, W]
+                img_pos = img_pos[0]  # 确保img_pos是张量 [bs, hidden_dim, H, W]
+                # print(f"img_feat shape: {img_feat.shape}")  # 例如 [bs, hidden_dim, 15, 15]
+                
+                # 特征融合
+                if prev_image is not None:
+                    # todo: 加权融合
+                    # print(f"img_feat: {img_feat}")
+                    # print(f"flow_feat: {flow_feat}")
+                    fused_feat = torch.cat([img_feat, flow_feat], dim=1)  # [bs, hidden_dim*2, H, W]
+                    fused_feat = self.fusion_conv(fused_feat)  # [bs, hidden_dim, H, W]
+                    # print(self.fusion_conv)
+                    all_features.append(fused_feat)
+                    
+                    # 关键修复：融合位置编码（示例：简单平均）
+                    # if img_pos is not None:
+                        # fused_pos = (img_pos + flow_pos) / 2  # [bs, hidden_dim, H, W]
+                    # print(img_pos)
+                    # fused_pos = img_pos
+                    
+
+                    if flow_pos is not None and img_pos is not None:
+                        print(f"img_pos min={img_pos.min().item()}, max={img_pos.max().item()}, mean={img_pos.mean().item()}, std={img_pos.std().item()}")
+                        print(f"flow_pos min={flow_pos.min().item()}, max={flow_pos.max().item()}, mean={flow_pos.mean().item()}, std={flow_pos.std().item()}")
+                        fused_pos = (img_pos + flow_pos) / 2
+                    else:
+                        fused_pos = img_pos  # fallback: 只用 img_pos
+
+                    all_positions.append(fused_pos)
+                    # else:
+
+                    #     print(f"camid{cam_id}")
+                    #     print(f"flow_feat: {flow_feat}")
+                    #     print(f"flow_pos: {flow_pos}")
+                    #     raise ValueError("Both img_pos and flow_pos should be non-None")
+                else:
+                    all_features.append(img_feat)
+                    all_positions.append(img_pos)
+                    
+
+            # 后续拼接操作
+            src = torch.cat(all_features, dim=3)  # [bs, hidden_dim, H, W*num_cam]
+            pos = torch.cat(all_positions, dim=3)  # [bs, hidden_dim, H, W*num_cam]
+            # src = torch.cat(all_features, dim=3)  
+            # pos = torch.cat(all_positions, dim=3)  
+            
+           
             proprio_input = self.input_proj_robot_state(qpos)
-            # fold camera dimension into width dimension
-            src = torch.cat(all_cam_features, axis=3)
-            pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            
+           
+            hs = self.transformer(
+                src=src,
+                mask=None,
+                query_embed=self.query_embed.weight,
+                pos_embed=pos,
+                latent_input=latent_input,
+                proprio_input=proprio_input,
+                additional_pos_embed=self.additional_pos_embed.weight
+            )[0]
         else:
+           
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
-            transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
+            transformer_input = torch.cat([qpos, env_state], axis=1)
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
+
+  
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         return a_hat, is_pad_hat, [mu, logvar], probs, binaries
-
 
 
 class CNNMLP(nn.Module):
@@ -282,7 +461,7 @@ def build(args):
     if args.no_encoder:
         encoder = None
     else:
-        encoder = build_transformer(args)
+        encoder = build_encoder(args)
 
     model = DETRVAE(
         backbones,
@@ -323,4 +502,3 @@ def build_cnnmlp(args):
     print("number of parameters: %.2fM" % (n_parameters/1e6,))
 
     return model
-

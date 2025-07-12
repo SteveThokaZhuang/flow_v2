@@ -228,6 +228,7 @@ class InsertionTask(BimanualViperXTask):
             reward = 3
         if pin_touched: # successful insertion
             reward = 4
+        print('all_contact_pairs:', all_contact_pairs)
         return reward
 
 
