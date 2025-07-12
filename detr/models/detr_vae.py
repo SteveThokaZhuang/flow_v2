@@ -281,7 +281,8 @@ class DETRVAE(nn.Module):
                     flow_feat, flow_pos = self.flow_backbones[cam_id](flow[:, cam_id])
                     flow_feat = self.input_proj_flow(flow_feat[0])  # [bs, hidden_dim, H, W]
                     flow_pos = flow_pos[0]  # [bs, hidden_dim, H, W]
-                    flow_feat = F.interpolate(flow_feat, size=(15, 20), mode='bilinear', align_corners=False)
+                    flow_pos = F.interpolate(flow_pos, size=(15, 20), mode='bilinear', align_corners=False) #do resizing to fit 15x20 of img_pos
+                    flow_feat = F.interpolate(flow_feat, size=(15, 20), mode='bilinear', align_corners=False) # same to fit img_feat
 
                     # print(f"flow_feat shape: {flow_feat.shape}")  # 例如 [bs, hidden_dim, 60, 60]
 
@@ -307,7 +308,10 @@ class DETRVAE(nn.Module):
                     # print(img_pos)
                     # fused_pos = img_pos
                     
-
+                    print(f"img_pos is None: {img_pos is None}")
+                    print(f"flow_pos is None: {flow_pos is None}")
+                    print(f"img_feat is None: {img_feat is None}")
+                    print(f"flow_feat is None: {flow_feat is None}")
                     if flow_pos is not None and img_pos is not None:
                         print(f"img_pos min={img_pos.min().item()}, max={img_pos.max().item()}, mean={img_pos.mean().item()}, std={img_pos.std().item()}")
                         print(f"flow_pos min={flow_pos.min().item()}, max={flow_pos.max().item()}, mean={flow_pos.mean().item()}, std={flow_pos.std().item()}")
