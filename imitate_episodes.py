@@ -468,6 +468,9 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                     ts = env.step(target_qpos, base_action)
                 else:
                     ts = env.step(target_qpos)
+                    print("qpos:", ts.observation['qpos'])
+
+
                 # print('step env: ', time.time() - time5)
 
                 ### for visualization
