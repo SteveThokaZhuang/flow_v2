@@ -305,4 +305,35 @@ class Transformer(nn.Module):
         )
         hs = hs.transpose(1, 2)
         return hs
-        ```
+ ```
+        
+
+
+## **特征融合**
+1. prev_image和cur_image通过raft计算光流并归一化
+```flow = self.flow_extractor(prev_image, cur_image)      # [bs, num_cam, 2, H, W]
+flow = torch.clamp(flow, -max_flow, max_flow) / max_flow
+```
+2. 过backbone泛化成feature和position
+3. 过alpha conv和flow融合
+``` 
+self.alpha_conv = nn.Sequential(
+                nn.Conv2d(2 * 512, 256, kernel_size=1),
+                nn.ReLU(),
+                nn.Conv2d(256, 512, kernel_size=1),
+                nn.Sigmoid()
+            )
+        self.input_proj_flow = n
+```
+4. 过transformer
+```
+hs = self.transformer(
+                src=src,
+                mask=None,
+                query_embed=self.query_embed.weight,
+                pos_embed=pos,
+                latent_input=latent_input,
+                proprio_input=proprio_input,
+                additional_pos_embed=self.additional_pos_embed.weight
+            )[0]
+```

@@ -16,30 +16,6 @@ import IPython
 e = IPython.embed
 import torch.nn.functional as F
 # stevez
-# class AttentionFusion(nn.Module):
-#     def __init__(self, in_channels, hidden_dim):
-#         # 初始化函数，接收输入通道数和隐藏维度作为参数
-#         super().__init__()
-#         # 调用父类的初始化函数
-#         # self.attention = nn.Sequential(
-#         #     # 定义注意力机制，使用nn.Sequential将多个层组合在一起
-#         #     nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
-#         #     # 使用卷积层将输入通道数转换为隐藏维度，卷积核大小为1
-#         #     nn.ReLU(),
-#         #     # 使用ReLU激活函数
-#         #     nn.Conv2d(hidden_dim, in_channels, kernel_size=1),
-#         #     # 使用卷积层将隐藏维度转换回输入通道数，卷积核大小为1
-#         #     nn.Sigmoid()
-#         #     # 使用Sigmoid激活函数，将输出限制在0和1之间
-#         # )
-#         self.attention = nn.Sequential(
-#                 nn.Conv2d(in_channels, in_channels // 2, kernel_size=1),
-#                 nn.ReLU(),
-#                 nn.Conv2d(in_channels // 2, in_channels, kernel_size=1),
-#                 nn.Sigmoid()
-#             )
-
-#         self.out_conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
 class AttentionFusion(nn.Module):
     def __init__(self, in_channels, hidden_dim):
         super().__init__()
@@ -49,13 +25,17 @@ class AttentionFusion(nn.Module):
             nn.Conv2d(hidden_dim, in_channels, kernel_size=1),
             nn.Sigmoid()
         )
-        self.out_conv = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)  # 改：不要强压到 hidden_dim
+        self.out_conv = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+
+        # 初始化（optional，但推荐）
+        nn.init.kaiming_normal_(self.out_conv.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x):
         attn = self.attention(x)
-        out = x * attn
+        out = x * (1 + attn)  # residual attention，保证信息流
         out = self.out_conv(out)
         return out
+
 class OpticalFlowExtractor(nn.Module):
     def __init__(self):
         super().__init__()
@@ -119,13 +99,19 @@ class DETRVAE(nn.Module):
         # print(f"hidden_dim (transformer.d_model): {hidden_dim}")
         # print(F"action_dim: {action_dim} (for action prediction)")
         self.flow_backbones = nn.ModuleList([
-            FlowBackbone(in_channels=2, hidden_dim=hidden_dim)  # 输入通道为2（光流场的x,y分量）
+            FlowBackbone(in_channels=2, hidden_dim=hidden_dim, debug=True)  # 输入通道为2（光流场的x,y分量）
             for _ in camera_names
         ])
         # stevez
+        self.alpha_conv = nn.Sequential(
+                nn.Conv2d(2 * 512, 256, kernel_size=1),
+                nn.ReLU(),
+                nn.Conv2d(256, 512, kernel_size=1),
+                nn.Sigmoid()
+            )
         self.input_proj_flow = nn.Conv2d(self.flow_backbones[0].num_channels, hidden_dim, kernel_size=1)
         # self.fusion_conv = AttentionFusion(1024, hidden_dim=1)
-        self.fusion_conv = AttentionFusion(1024, hidden_dim=128)
+        self.fusion_conv = AttentionFusion(1024, hidden_dim=256)
 
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
@@ -194,9 +180,6 @@ class DETRVAE(nn.Module):
         cls_embed = cls_embed.unsqueeze(0)  # Shape [1, 1, 512]
         cls_embed = cls_embed.expand(actual_bs, -1, -1)  # Shape [actual_bs, 1, 512]
         
-        # Debug print to verify shapes
-        print(f'Shapes - cls: {cls_embed.shape}, qpos: {qpos_embed.shape}, action: {action_embed.shape}')
-        
         # Concatenate tensors along sequence dimension
         encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], dim=1)  # [actual_bs, 102, 512] or [actual_bs, 2, 512]
         encoder_input = encoder_input.permute(1, 0, 2)  # (seq+2, actual_bs, hidden_dim)
@@ -247,17 +230,11 @@ class DETRVAE(nn.Module):
    
     # stevez
     def forward(self, qpos, cur_image, env_state, actions=None, is_pad=None, vq_sample=None, prev_image=None):
-        # print(f"action in forward: {actions.shape}")
-        # print(f"action is :{actions}")
         device = qpos.device  # 获取模型当前设备
         if actions is not None:
             actions = actions.float().to(device)
         else:
             actions = torch.zeros(8, 100, 16, device=device)
-        # print(f"actions shape : {actions.shape}")
-        # actions = actions.float()
-        # print(f"actions:{actions}")
-
         
         latent_input, probs, binaries, mu, logvar = self.encode(qpos, actions, is_pad, vq_sample)
 
@@ -268,7 +245,7 @@ class DETRVAE(nn.Module):
                     prev_image = prev_image.float()
                     cur_image = cur_image.float()
                     flow = self.flow_extractor(prev_image, cur_image)  # [bs, num_cam, 2, H, W]
-                    max_flow = 20.0  # 视你的场景而定，通常 10~40 像素
+                    max_flow = 20.0
                     flow = torch.clamp(flow, -max_flow, max_flow) / max_flow
 
             
@@ -276,67 +253,45 @@ class DETRVAE(nn.Module):
             all_features = []
             all_positions = []
             for cam_id in range(len(self.camera_names)):
-                # 光流分支
                 if prev_image is not None:
                     flow_feat, flow_pos = self.flow_backbones[cam_id](flow[:, cam_id])
                     flow_feat = self.input_proj_flow(flow_feat[0])  # [bs, hidden_dim, H, W]
                     flow_pos = flow_pos[0]  # [bs, hidden_dim, H, W]
+                    flow_pos = flow_pos[0:1]  # 取第一个 batch，对齐到 img_pos
                     flow_pos = F.interpolate(flow_pos, size=(15, 20), mode='bilinear', align_corners=False) #do resizing to fit 15x20 of img_pos
                     flow_feat = F.interpolate(flow_feat, size=(15, 20), mode='bilinear', align_corners=False) # same to fit img_feat
-
-                    # print(f"flow_feat shape: {flow_feat.shape}")  # 例如 [bs, hidden_dim, 60, 60]
-
-                # 图像分支
+              
                 img_feat, img_pos = self.backbones[cam_id](cur_image[:, cam_id])
                 img_feat = self.input_proj(img_feat[0])  # [bs, hidden_dim, H, W]
-                img_pos = img_pos[0]  # 确保img_pos是张量 [bs, hidden_dim, H, W]
-                # print(f"img_feat shape: {img_feat.shape}")  # 例如 [bs, hidden_dim, 15, 15]
-                
-                # 特征融合
+                img_pos = img_pos[0]  
+               
                 if prev_image is not None:
-                    # todo: 加权融合
-                    # print(f"img_feat: {img_feat}")
-                    # print(f"flow_feat: {flow_feat}")
+                   
                     fused_feat = torch.cat([img_feat, flow_feat], dim=1)  # [bs, hidden_dim*2, H, W]
                     fused_feat = self.fusion_conv(fused_feat)  # [bs, hidden_dim, H, W]
                     # print(self.fusion_conv)
                     all_features.append(fused_feat)
                     
-                    # 关键修复：融合位置编码（示例：简单平均）
-                    # if img_pos is not None:
-                        # fused_pos = (img_pos + flow_pos) / 2  # [bs, hidden_dim, H, W]
-                    # print(img_pos)
-                    # fused_pos = img_pos
                     
-                    print(f"img_pos is None: {img_pos is None}")
-                    print(f"flow_pos is None: {flow_pos is None}")
-                    print(f"img_feat is None: {img_feat is None}")
-                    print(f"flow_feat is None: {flow_feat is None}")
                     if flow_pos is not None and img_pos is not None:
-                        print(f"img_pos min={img_pos.min().item()}, max={img_pos.max().item()}, mean={img_pos.mean().item()}, std={img_pos.std().item()}")
-                        print(f"flow_pos min={flow_pos.min().item()}, max={flow_pos.max().item()}, mean={flow_pos.mean().item()}, std={flow_pos.std().item()}")
-                        fused_pos = (img_pos + flow_pos) / 2
+                        print(f"img_pos_shape: {img_pos.shape}")
+                        print(f"flow_pos_shape: {flow_pos.shape}")
+                        alpha = self.alpha_conv(torch.cat([img_pos, flow_pos], dim=1))
+                        fused_pos = alpha * img_pos + (1 - alpha) * flow_pos
+                        print(f"[DEBUG] fused_feat: min={fused_feat.min().item():.3f}, max={fused_feat.max().item():.3f}, mean={fused_feat.mean().item():.3f}, std={fused_feat.std().item():.3f}")
+                        print(f"[DEBUG] fused_pos: min={fused_pos.min().item():.3f}, max={fused_pos.max().item():.3f}, mean={fused_pos.mean().item():.3f}, std={fused_pos.std().item():.3f}")
+
                     else:
-                        fused_pos = img_pos  # fallback: 只用 img_pos
+                        fused_pos = img_pos    
 
                     all_positions.append(fused_pos)
-                    # else:
-
-                    #     print(f"camid{cam_id}")
-                    #     print(f"flow_feat: {flow_feat}")
-                    #     print(f"flow_pos: {flow_pos}")
-                    #     raise ValueError("Both img_pos and flow_pos should be non-None")
                 else:
                     all_features.append(img_feat)
                     all_positions.append(img_pos)
                     
-
-            # 后续拼接操作
             src = torch.cat(all_features, dim=3)  # [bs, hidden_dim, H, W*num_cam]
             pos = torch.cat(all_positions, dim=3)  # [bs, hidden_dim, H, W*num_cam]
-            # src = torch.cat(all_features, dim=3)  
-            # pos = torch.cat(all_positions, dim=3)  
-            
+        
            
             proprio_input = self.input_proj_robot_state(qpos)
             

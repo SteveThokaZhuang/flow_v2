@@ -190,6 +190,13 @@ class InsertionTask(BimanualViperXTask):
     def get_env_state(physics):
         env_state = physics.data.qpos.copy()[16:]
         return env_state
+    # stevez
+    def log_contact_pairs(all_contact_pairs):
+        critical_contacts = [pair for pair in all_contact_pairs if 'gripper' not in pair[0] and 'gripper' not in pair[1]]
+        if critical_contacts:
+            print("[CONTACT WARNING] Critical contacts detected:")
+            for pair in critical_contacts:
+                print(f"  {pair}")
 
     def get_reward(self, physics):
         # return whether peg touches the pin
@@ -228,7 +235,7 @@ class InsertionTask(BimanualViperXTask):
             reward = 3
         if pin_touched: # successful insertion
             reward = 4
-        print('all_contact_pairs:', all_contact_pairs)
+        print('all_contact_pairs:', all_contact_pairs) # stevez
         return reward
 
 

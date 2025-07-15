@@ -169,8 +169,8 @@ def main(args):
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, name_filter, camera_names, batch_size_train, batch_size_val, args['chunk_size'], args['skip_mirrored_data'], config['load_pretrain'], policy_class, stats_dir_l=stats_dir, sample_weights=sample_weights, train_ratio=train_ratio)
-    print(f"train_dataloader: {train_dataloader}")
-    print(f"val_dataloader: {val_dataloader}")
+    # print(f"train_dataloader: {train_dataloader}")
+    # print(f"val_dataloader: {val_dataloader}")
     # save dataset stats
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
@@ -301,6 +301,9 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
         post_process = lambda a: ((a + 1) / 2) * (stats['action_max'] - stats['action_min']) + stats['action_min']
     else:
         post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+        print(f"action_std: {stats['action_std']}")
+        print(f"action_mean: {stats['action_mean']}")
+
 
     # load environment
     if real_robot:
@@ -398,7 +401,7 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                             if rollout_id == 0:
                                 for _ in range(10):
                                     vq_sample = latent_model.generate(1, temperature=1, x=None)
-                                    print(torch.nonzero(vq_sample[0])[:, 1].cpu().numpy())
+                                    # print(torch.nonzero(vq_sample[0])[:, 1].cpu().numpy())
                             vq_sample = latent_model.generate(1, temperature=1, x=None)
                             all_actions = policy(qpos, curr_image, vq_sample=vq_sample)
                         else:
@@ -423,6 +426,7 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                         # if t % query_frequency == query_frequency - 1:
                         #     # zero out base actions to avoid overshooting
                         #     raw_action[0, -2:] = 0
+                    
                 elif config['policy_class'] == "Diffusion":
                     if t % query_frequency == 0:
                         all_actions = policy(qpos, curr_image)
@@ -444,8 +448,18 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                 time4 = time.time()
                 raw_action = raw_action.squeeze(0).cpu().numpy()
                 action = post_process(raw_action)
-                print("action min:", action.min().item(), "max:", action.max().item(), "mean:", action.mean().item(), "std:", action.std().item())
+                
+                # print("action min:", action.min().item(), "max:", action.max().item(), "mean:", action.mean().item(), "std:", action.std().item())
                 target_qpos = action[:-2]
+                print(f"[DEBUG] target_qpos min={target_qpos.min()}, max={target_qpos.max()}, mean={target_qpos.mean()}")
+    
+                joint_lower_limits = np.array([-2.0] * len(target_qpos))  # 例，按真实模型改
+                joint_upper_limits = np.array([2.0] * len(target_qpos))
+                target_qpos = np.clip(target_qpos, joint_lower_limits, joint_upper_limits) # stevez
+                # for i in range(len(target_qpos)):
+                #     print(f"Joint {i}: {target_qpos[i]}")
+
+
 
                 # if use_actuator_net:
                 #     assert(not temporal_agg)
@@ -461,17 +475,21 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                 # base_action = calibrate_linear_vel(base_action, c=0.19)
                 # base_action = postprocess_base_action(base_action)
                 # print('post process: ', time.time() - time4)
-
+                # print(f"[DEBUG] in eval raw_action: min={raw_action.min()}, max={raw_action.max()}, mean={raw_action.mean()}, std={raw_action.std()}")
+                # print(f"[DEBUG] in eval target_qpos[:5]: {target_qpos[:5]}, base_action: {base_action}") # stevez debug
                 ### step the environment
                 time5 = time.time()
                 if real_robot:
                     ts = env.step(target_qpos, base_action)
                 else:
+                    # for _ in range(5):
                     ts = env.step(target_qpos)
-                    print("qpos:", ts.observation['qpos'])
+                    print(f"Step reward: {ts.reward}, done: {ts.last()}, obs_qpos: {ts.observation['qpos']}")
+
 
 
                 # print('step env: ', time.time() - time5)
+                # check_action_range(raw_action, action, target_qpos, base_action)
 
                 ### for visualization
                 qpos_list.append(qpos_numpy)
@@ -548,6 +566,13 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
 
     return success_rate, avg_return
 
+def check_action_range(raw_action, action, target_qpos, base_action):
+    print(f"[CHECK] raw_action: min={raw_action.min():.3f}, max={raw_action.max():.3f}, mean={raw_action.mean():.3f}, std={raw_action.std():.3f}")
+    print(f"[CHECK] action(post-processed): min={action.min():.3f}, max={action.max():.3f}, mean={action.mean():.3f}, std={action.std():.3f}")
+    print(f"[CHECK] target_qpos: min={target_qpos.min():.3f}, max={target_qpos.max():.3f}")
+    print(f"[CHECK] base_action: {base_action}")
+    if np.any(np.isnan(action)) or np.any(np.isinf(action)):
+        print("[WARNING] Detected NaN or Inf in actions!")
 
 def forward_pass(data, policy):
     global prev_image_ulti
